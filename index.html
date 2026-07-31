@@ -198,7 +198,23 @@
 
 </div>
 
-<script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js";
+import { getFirestore, doc, getDoc, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyC399MvSiF3PWF_ZTdFr0UqaoC6Fo7WsrY",
+  authDomain: "wiezen-club.firebaseapp.com",
+  projectId: "wiezen-club",
+  storageBucket: "wiezen-club.firebasestorage.app",
+  messagingSenderId: "184449254432",
+  appId: "1:184449254432:web:e4f4f93acae57a9a736845"
+};
+const fbApp = initializeApp(firebaseConfig);
+const db = getFirestore(fbApp);
+// eigen collectie 'sleeptracker' zodat dit los staat van je wiezen-data
+function docRef(key){ return doc(db, 'sleeptracker', key); }
+
 const KEY = 'sleep-entries';
 const NIGHT_KEY = 'sleep-current-night';
 // currentNight = { segments: [{start, end}], tags: [], note: '', alcoholQty: '1' }
@@ -209,19 +225,28 @@ let selectedTags = new Set();
 
 const $ = id => document.getElementById(id);
 
-// Opslag-laag: gebruikt window.storage binnen Claude, valt anders terug op
-// gewone localStorage — zodat dit bestand ook zelfstandig op GitHub Pages werkt.
-const storage = window.storage ? window.storage : {
+// Opslag-laag: Firestore (wiezen-club) als primaire, gedeelde opslag tussen
+// je toestellen. Bij een netwerkprobleem valt hij terug op localStorage
+// van dit ene toestel, zodat de tracker altijd blijft werken.
+const storage = {
   get: async (key) => {
-    const v = localStorage.getItem(key);
-    return v === null ? null : { key, value: v };
+    try{
+      const snap = await getDoc(docRef(key));
+      if(snap.exists()) return { key, value: snap.data().value };
+      return null;
+    }catch(e){
+      const v = localStorage.getItem(key);
+      return v === null ? null : { key, value: v };
+    }
   },
   set: async (key, value) => {
-    localStorage.setItem(key, value);
+    localStorage.setItem(key, value); // lokale back-up, altijd
+    await setDoc(docRef(key), { value, updatedAt: Date.now() });
     return { key, value };
   },
   delete: async (key) => {
     localStorage.removeItem(key);
+    await deleteDoc(docRef(key));
     return { key, deleted: true };
   }
 };
@@ -234,14 +259,14 @@ async function checkStorage(){
     await storage.set('storage-test', testVal);
     const readback = await storage.get('storage-test');
     if(readback && readback.value === testVal){
-      el.textContent = '✓ Opslag werkt';
+      el.textContent = '✓ Sync werkt (wiezen-club)';
       el.style.background = 'rgba(127,174,142,0.18)';
       el.style.color = '#7fae8e';
     } else {
       throw new Error('readback mismatch');
     }
   }catch(e){
-    el.textContent = '⚠️ Opslag werkt NIET — gegevens gaan verloren';
+    el.textContent = '⚠️ Sync werkt niet — enkel lokale opslag';
     el.style.background = 'rgba(217,118,90,0.18)';
     el.style.color = '#d9765a';
   }
@@ -269,16 +294,9 @@ function isSleeping(){
          currentNight.segments[currentNight.segments.length-1].end === null;
 }
 
-async function loadAll(){
-  try{
-    const res = await storage.get(KEY);
-    entries = res ? JSON.parse(res.value) : [];
-  }catch(e){ entries = []; }
-  // migratie: oude nachten hadden {sleepStart, wake} i.p.v. {segments, totalMs}
-  let migrated = false;
-  entries = entries.map(e=>{
+function migrateEntries(raw){
+  return raw.map(e=>{
     if(!e.segments){
-      migrated = true;
       return {
         segments: [{ start: e.sleepStart, end: e.wake }],
         totalMs: new Date(e.wake) - new Date(e.sleepStart),
@@ -288,6 +306,17 @@ async function loadAll(){
     }
     return e;
   });
+}
+
+async function loadAll(){
+  try{
+    const res = await storage.get(KEY);
+    entries = res ? JSON.parse(res.value) : [];
+  }catch(e){ entries = []; }
+  // migratie: oude nachten hadden {sleepStart, wake} i.p.v. {segments, totalMs}
+  const before = JSON.stringify(entries);
+  entries = migrateEntries(entries);
+  const migrated = JSON.stringify(entries) !== before;
   if(migrated) await saveEntries();
   try{
     const res = await storage.get(NIGHT_KEY);
@@ -552,6 +581,27 @@ setInterval(()=>{ if(currentNight) render(); }, 60000);
 
 loadAll();
 checkStorage();
+
+// --- Live synchronisatie tussen toestellen (iPhone/iPad) via Firestore ---
+onSnapshot(docRef(KEY), (snap)=>{
+  if(snap.metadata.hasPendingWrites) return; // eigen wijziging, al lokaal verwerkt
+  if(!snap.exists()) return;
+  try{
+    entries = migrateEntries(JSON.parse(snap.data().value));
+    renderHistory();
+    renderSummary();
+  }catch(e){}
+});
+onSnapshot(docRef(NIGHT_KEY), (snap)=>{
+  if(snap.metadata.hasPendingWrites) return;
+  const remote = snap.exists() ? JSON.parse(snap.data().value) : null;
+  currentNight = remote;
+  if(currentNight){
+    selectedTags = new Set((currentNight.tags||[]).filter(t => !t.startsWith('Alcohol (')));
+    if((currentNight.tags||[]).some(t => t.startsWith('Alcohol ('))) selectedTags.add('Alcohol');
+  }
+  render();
+});
 
 // --- Siri Shortcut ondersteuning: ?actie=slapen / wakker / terug / klaar ---
 async function handleUrlAction(){
