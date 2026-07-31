@@ -168,6 +168,10 @@
     <button class="btn-finish" id="btnFinish">✓ Nacht afronden</button>
   </div>
 
+  <div id="cancelNightWrap" style="display:none; text-align:center; margin-top:-8px; margin-bottom:18px;">
+    <button id="btnCancelNight" type="button" style="background:none; border:none; color:#9aa2b8; font-size:12.5px; text-decoration:underline; padding:4px;">Annuleer deze nacht (fout gestart)</button>
+  </div>
+
   <div id="tagBlock" style="display:none;">
     <div class="quick-tags" id="tags">
       <div class="tag" data-tag="Mounjaro-avond">Mounjaro genomen</div>
@@ -379,9 +383,26 @@ function render(){
     btnRow.style.display = 'none';
     btnRowPaused.style.display = 'grid';
     tagBlock.style.display = 'block';
-    segMini.innerHTML = currentNight.segments.map(s =>
-      `${fmtTime(s.start)} → ${s.end ? fmtTime(s.end) : '…'}`
-    ).join(' · ');
+    if(currentNight.segments.length > 1){
+      segMini.innerHTML = currentNight.segments.map((s,i) =>
+        `<span style="display:inline-flex; align-items:center; gap:4px; background:var(--panel-2); border:1px solid var(--line); border-radius:999px; padding:3px 8px; margin:2px 4px 2px 0;">
+          ${fmtTime(s.start)} → ${s.end ? fmtTime(s.end) : '…'}
+          <button data-seg="${i}" class="seg-del-btn" style="background:none; border:none; color:var(--alert); font-size:13px; padding:0; line-height:1; cursor:pointer;">✕</button>
+        </span>`
+      ).join('');
+      segMini.querySelectorAll('.seg-del-btn').forEach(btn=>{
+        btn.addEventListener('click', async (ev)=>{
+          const idx = parseInt(ev.currentTarget.dataset.seg);
+          currentNight.segments.splice(idx,1);
+          if(currentNight.segments.length === 0){ currentNight = null; }
+          await saveNight();
+          render();
+          flashHint('Periode gewist');
+        });
+      });
+    } else {
+      segMini.textContent = '';
+    }
   } else {
     // niets actief
     statusLabel.textContent = 'Status';
@@ -400,6 +421,7 @@ function render(){
   renderSummary();
 
   const editLink = $('editTimeLink');
+  $('cancelNightWrap').style.display = currentNight ? 'block' : 'none';
   if(currentNight && currentNight.segments.length > 0){
     editLink.style.display = 'flex';
     const lastSeg = currentNight.segments[currentNight.segments.length-1];
@@ -558,6 +580,15 @@ $('btnFinish').addEventListener('click', async ()=>{
   await saveNight();
   render();
   flashHint('Opgeslagen — goeiemorgen ☀️');
+});
+
+$('btnCancelNight').addEventListener('click', async ()=>{
+  currentNight = null;
+  selectedTags.clear();
+  $('noteInput').value = '';
+  await saveNight();
+  render();
+  flashHint('Nacht geannuleerd — niets opgeslagen');
 });
 
 document.querySelectorAll('.tag').forEach(tagEl=>{
