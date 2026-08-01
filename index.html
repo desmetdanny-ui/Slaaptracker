@@ -230,4 +230,453 @@ let selectedTags = new Set();
 const $ = id => document.getElementById(id);
 
 // Opslag-laag: Firestore (wiezen-club) als primaire, gedeelde opslag tussen
-// je to
+// je toestellen. Bij een netwerkprobleem valt hij terug op localStorage
+// van dit ene toestel, zodat de tracker altijd blijft werken.
+function withTimeout(promise, ms){
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(()=> reject(new Error('timeout')), ms))
+  ]);
+}
+
+const storage = {
+  get: async (key) => {
+    try{
+      const snap = await withTimeout(getDoc(docRef(key)), 4000);
+      if(snap.exists()) return { key, value: snap.data().value };
+      return null;
+    }catch(e){
+      const v = localStorage.getItem(key);
+      return v === null ? null : { key, value: v };
+    }
+  },
+  set: async (key, value) => {
+    localStorage.setItem(key, value); // lokale back-up, altijd
+    try{ await withTimeout(setDoc(docRef(key), { value, updatedAt: Date.now() }), 4000); }
+    catch(e){ /* lokaal staat het al goed, sync volgt later vanzelf */ }
+    return { key, value };
+  },
+  delete: async (key) => {
+    localStorage.removeItem(key);
+    try{ await withTimeout(deleteDoc(docRef(key)), 4000); }
+    catch(e){ /* lokaal al verwijderd */ }
+    return { key, deleted: true };
+  }
+};
+
+async function checkStorage(){
+  const el = $('storageStatus');
+  try{
+    if(!storage) throw new Error('geen storage');
+    const testVal = 'ok-' + Date.now();
+    await storage.set('storage-test', testVal);
+    const readback = await storage.get('storage-test');
+    if(readback && readback.value === testVal){
+      el.textContent = '✓ Sync werkt (wiezen-club)';
+      el.style.background = 'rgba(127,174,142,0.18)';
+      el.style.color = '#7fae8e';
+    } else {
+      throw new Error('readback mismatch');
+    }
+  }catch(e){
+    el.textContent = '⚠️ Sync werkt niet — enkel lokale opslag';
+    el.style.background = 'rgba(217,118,90,0.18)';
+    el.style.color = '#d9765a';
+  }
+}
+
+function fmtTime(iso){
+  const d = new Date(iso);
+  return d.toLocaleTimeString('nl-BE', {hour:'2-digit', minute:'2-digit'});
+}
+function fmtDate(iso){
+  const d = new Date(iso);
+  return d.toLocaleDateString('nl-BE', {weekday:'short', day:'numeric', month:'short'});
+}
+function fmtDuration(ms){
+  const totalMin = Math.round(ms/60000);
+  const h = Math.floor(totalMin/60);
+  const m = totalMin%60;
+  return `${h}u ${m}min`;
+}
+function segTotalMs(segments){
+  return segments.reduce((sum,s)=> sum + ((s.end ? new Date(s.end) : new Date()) - new Date(s.start)), 0);
+}
+function isSleeping(){
+  return currentNight && currentNight.segments.length > 0 &&
+         currentNight.segments[currentNight.segments.length-1].end === null;
+}
+
+function migrateEntries(raw){
+  return raw.map(e=>{
+    if(!e.segments){
+      return {
+        segments: [{ start: e.sleepStart, end: e.wake }],
+        totalMs: new Date(e.wake) - new Date(e.sleepStart),
+        tags: e.tags || [],
+        note: e.note || ''
+      };
+    }
+    return e;
+  });
+}
+
+async function loadAll(){
+  try{
+    const res = await storage.get(KEY);
+    entries = res ? JSON.parse(res.value) : [];
+  }catch(e){ entries = []; }
+  // migratie: oude nachten hadden {sleepStart, wake} i.p.v. {segments, totalMs}
+  const before = JSON.stringify(entries);
+  entries = migrateEntries(entries);
+  const migrated = JSON.stringify(entries) !== before;
+  if(migrated) await saveEntries();
+  try{
+    const res = await storage.get(NIGHT_KEY);
+    currentNight = res ? JSON.parse(res.value) : null;
+  }catch(e){ currentNight = null; }
+  if(currentNight){
+    selectedTags = new Set((currentNight.tags||[]).filter(t => !t.startsWith('Alcohol (')));
+    // restore alcohol flag if present
+    if((currentNight.tags||[]).some(t => t.startsWith('Alcohol ('))) selectedTags.add('Alcohol');
+  }
+  render();
+}
+
+async function saveEntries(){
+  try{ await storage.set(KEY, JSON.stringify(entries)); }
+  catch(e){ flashHint('Opslaan mislukt, probeer opnieuw'); }
+}
+async function saveNight(){
+  try{
+    if(currentNight){ await storage.set(NIGHT_KEY, JSON.stringify(currentNight)); }
+    else{ await storage.delete(NIGHT_KEY); }
+  }catch(e){ flashHint('⚠️ Niet opgeslagen — check opslagstatus boven'); }
+}
+
+function flashHint(msg){
+  const h = $('saveHint');
+  h.textContent = msg;
+  setTimeout(()=>{ if(h.textContent===msg) h.textContent=''; }, 2000);
+}
+
+function render(){
+  const statusValue = $('statusValue');
+  const statusSub = $('statusSub');
+  const statusLabel = $('statusLabel');
+  const segMini = $('segmentsMini');
+  const btnRow = $('btnRow');
+  const btnRowPaused = $('btnRowPaused');
+  const tagBlock = $('tagBlock');
+
+  if(currentNight && isSleeping()){
+    // actief aan het slapen
+    const lastSeg = currentNight.segments[currentNight.segments.length-1];
+    statusLabel.textContent = currentNight.segments.length > 1 ? 'Terug ingeslapen om' : 'Je slaapt sinds';
+    statusValue.textContent = fmtTime(lastSeg.start);
+    const totalMs = segTotalMs(currentNight.segments);
+    statusSub.textContent = `${fmtDuration(totalMs)} geslapen deze nacht`;
+    btnRow.style.display = 'grid';
+    btnRowPaused.style.display = 'none';
+    $('btnSleep').disabled = true;
+    $('btnWake').disabled = false;
+    tagBlock.style.display = 'none';
+    segMini.textContent = currentNight.segments.length > 1
+      ? `${currentNight.segments.length} periodes deze nacht` : '';
+  } else if(currentNight && !isSleeping()){
+    // wakker, nacht nog niet afgesloten
+    const totalMs = segTotalMs(currentNight.segments);
+    statusLabel.textContent = 'Wakker — nacht loopt nog';
+    statusValue.textContent = fmtDuration(totalMs);
+    statusSub.textContent = `Al geslapen sinds ${fmtTime(currentNight.segments[0].start)}, ${currentNight.segments.length} periode${currentNight.segments.length>1?'s':''}`;
+    btnRow.style.display = 'none';
+    btnRowPaused.style.display = 'grid';
+    tagBlock.style.display = 'block';
+    if(currentNight.segments.length > 1){
+      segMini.innerHTML = currentNight.segments.map((s,i) =>
+        `<span style="display:inline-flex; align-items:center; gap:4px; background:var(--panel-2); border:1px solid var(--line); border-radius:999px; padding:3px 8px; margin:2px 4px 2px 0;">
+          ${fmtTime(s.start)} → ${s.end ? fmtTime(s.end) : '…'}
+          <button data-seg="${i}" class="seg-del-btn" style="background:none; border:none; color:var(--alert); font-size:13px; padding:0; line-height:1; cursor:pointer;">✕</button>
+        </span>`
+      ).join('');
+      segMini.querySelectorAll('.seg-del-btn').forEach(btn=>{
+        btn.addEventListener('click', async (ev)=>{
+          const idx = parseInt(ev.currentTarget.dataset.seg);
+          currentNight.segments.splice(idx,1);
+          if(currentNight.segments.length === 0){ currentNight = null; }
+          await saveNight();
+          render();
+          flashHint('Periode gewist');
+        });
+      });
+    } else {
+      segMini.textContent = '';
+    }
+  } else {
+    // niets actief
+    statusLabel.textContent = 'Status';
+    statusValue.textContent = 'Wakker';
+    const last = entries[0];
+    statusSub.textContent = last ? `Laatste nacht: ${fmtDuration(last.totalMs)}` : 'Nog geen gegevens';
+    btnRow.style.display = 'grid';
+    btnRowPaused.style.display = 'none';
+    $('btnSleep').disabled = false;
+    $('btnWake').disabled = true;
+    tagBlock.style.display = 'none';
+    segMini.textContent = '';
+  }
+
+  renderHistory();
+  renderSummary();
+
+  const editLink = $('editTimeLink');
+  $('cancelNightWrap').style.display = currentNight ? 'block' : 'none';
+  if(currentNight && currentNight.segments.length > 0){
+    editLink.style.display = 'flex';
+    const lastSeg = currentNight.segments[currentNight.segments.length-1];
+    const d = new Date(lastSeg.start);
+    const pad = n => String(n).padStart(2,'0');
+    const localVal = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if(document.activeElement !== $('editStartTime')){
+      $('editStartTime').value = localVal;
+    }
+  } else {
+    editLink.style.display = 'none';
+  }
+}
+
+$('editStartTime').addEventListener('change', async ()=>{
+  if(!currentNight || currentNight.segments.length === 0) return;
+  const val = $('editStartTime').value; // "YYYY-MM-DDTHH:MM"
+  if(!val) return;
+  const corrected = new Date(val); // interpreteert als lokale tijd
+  if(isNaN(corrected.getTime())) return;
+  const lastSeg = currentNight.segments[currentNight.segments.length-1];
+  lastSeg.start = corrected.toISOString();
+  await saveNight();
+  render();
+  flashHint('Startmoment aangepast');
+});
+
+function renderSummary(){
+  const box = $('summary');
+  if(entries.length === 0){ box.innerHTML = ''; return; }
+  const recent = entries.slice(0, 14);
+  const avgMs = recent.reduce((sum,e)=> sum + e.totalMs, 0) / recent.length;
+  const shortCount = recent.filter(e => e.totalMs < 6*3600*1000).length;
+  const tagCounts = {};
+  recent.forEach(e => (e.tags||[]).forEach(t => { tagCounts[t] = (tagCounts[t]||0)+1; }));
+  const topTag = Object.entries(tagCounts).sort((a,b)=>b[1]-a[1])[0];
+  box.innerHTML = `
+    <div class="summary-card">
+      <div class="summary-item">
+        <div class="summary-num">${fmtDuration(avgMs)}</div>
+        <div class="summary-label">Gem. (${recent.length}n)</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-num">${shortCount}</div>
+        <div class="summary-label">Nachten &lt;6u</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-num">${topTag ? topTag[1] : '–'}</div>
+        <div class="summary-label">${topTag ? topTag[0] : 'Geen patroon'}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderHistory(){
+  const hist = $('history');
+  if(entries.length === 0){
+    hist.innerHTML = '<div class="empty">Nog geen nachten geregistreerd.<br>Druk op "Ga slapen" om te beginnen.</div>';
+    return;
+  }
+  hist.innerHTML = entries.map((e, i) => {
+    const durTxt = fmtDuration(e.totalMs);
+    const isShort = e.totalMs < 6*3600*1000;
+    const tagsTxt = (e.tags && e.tags.length) ? e.tags.join(' · ') : '';
+    const noteTxt = e.note ? e.note : '';
+    const combinedNote = [tagsTxt, noteTxt].filter(Boolean).join(' — ');
+    const segsTxt = e.segments.length > 1
+      ? e.segments.map(s => `${fmtTime(s.start)}→${fmtTime(s.end)}`).join(' · ')
+      : '';
+    const first = e.segments[0].start;
+    const last = e.segments[e.segments.length-1].end;
+    return `
+      <div class="entry">
+        <div class="entry-top">
+          <div class="entry-date">${fmtDate(first)}</div>
+          <div class="entry-dur ${isShort?'short':''}">${durTxt}</div>
+        </div>
+        <div class="entry-times">${fmtTime(first)} → ${fmtTime(last)}${e.segments.length>1 ? ` · ${e.segments.length} periodes` : ''}</div>
+        ${segsTxt ? `<div class="entry-segs">${segsTxt}</div>` : ''}
+        ${combinedNote ? `<div class="entry-note">${escapeHtml(combinedNote)}</div>` : ''}
+        <button class="entry-del" data-idx="${i}">verwijderen</button>
+      </div>
+    `;
+  }).join('');
+
+  hist.querySelectorAll('.entry-del').forEach(btn=>{
+    btn.addEventListener('click', async (ev)=>{
+      const idx = parseInt(ev.target.dataset.idx);
+      entries.splice(idx,1);
+      await saveEntries();
+      render();
+    });
+  });
+}
+
+function escapeHtml(s){
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// --- Ga slapen: start nieuwe nacht of hervat bestaande ---
+$('btnSleep').addEventListener('click', async ()=>{
+  if(!currentNight){
+    currentNight = { segments: [], tags: [], note: '' };
+    selectedTags.clear();
+    $('noteInput').value = '';
+    $('alcoholQty').value = '1';
+    $('alcoholField').classList.remove('show');
+    document.querySelectorAll('.tag').forEach(t=>t.classList.remove('active'));
+  }
+  currentNight.segments.push({ start: new Date().toISOString(), end: null });
+  await saveNight();
+  render();
+  flashHint('Slaap zacht 🌙');
+});
+
+// --- Wakker geworden: sluit huidig segment, nacht blijft open ---
+$('btnWake').addEventListener('click', async ()=>{
+  if(!currentNight || !isSleeping()) return;
+  currentNight.segments[currentNight.segments.length-1].end = new Date().toISOString();
+  await saveNight();
+  render();
+  flashHint('Genoteerd — goed geslapen?');
+});
+
+// --- Terug slapen: nieuw segment starten binnen dezelfde nacht ---
+$('btnAgain').addEventListener('click', async ()=>{
+  if(!currentNight || isSleeping()) return;
+  currentNight.segments.push({ start: new Date().toISOString(), end: null });
+  await saveNight();
+  render();
+  flashHint('Slaap zacht 🌙');
+});
+
+// --- Nacht afronden: definitief opslaan met tags/notitie ---
+$('btnFinish').addEventListener('click', async ()=>{
+  if(!currentNight || isSleeping()) return;
+  const tagsOut = Array.from(selectedTags).map(t=>{
+    if(t === 'Alcohol'){
+      const qty = $('alcoholQty').value || '?';
+      return `Alcohol (${qty} glazen)`;
+    }
+    return t;
+  });
+  const entry = {
+    segments: currentNight.segments,
+    totalMs: segTotalMs(currentNight.segments),
+    tags: tagsOut,
+    note: $('noteInput').value.trim()
+  };
+  entries.unshift(entry);
+  currentNight = null;
+  selectedTags.clear();
+  await saveEntries();
+  await saveNight();
+  render();
+  flashHint('Opgeslagen — goeiemorgen ☀️');
+});
+
+$('btnCancelNight').addEventListener('click', async ()=>{
+  currentNight = null;
+  selectedTags.clear();
+  $('noteInput').value = '';
+  await saveNight();
+  render();
+  flashHint('Nacht geannuleerd — niets opgeslagen');
+});
+
+document.querySelectorAll('.tag').forEach(tagEl=>{
+  tagEl.addEventListener('click', async ()=>{
+    const tag = tagEl.dataset.tag;
+    if(selectedTags.has(tag)){
+      selectedTags.delete(tag);
+      tagEl.classList.remove('active');
+    }else{
+      selectedTags.add(tag);
+      tagEl.classList.add('active');
+    }
+    if(tag === 'Alcohol'){
+      $('alcoholField').classList.toggle('show', selectedTags.has('Alcohol'));
+    }
+  });
+});
+
+// live update terwijl je slaapt of terwijl nacht nog open staat
+setInterval(()=>{ if(currentNight) render(); }, 60000);
+
+loadAll();
+checkStorage();
+// veiligheidsnet: forceer na 5s hoe dan ook een render, zelfs bij onvoorziene hang
+setTimeout(()=>{ if($('statusValue').textContent === 'Laden…') render(); }, 5000);
+
+// --- Live synchronisatie tussen toestellen (iPhone/iPad) via Firestore ---
+onSnapshot(docRef(KEY), (snap)=>{
+  if(snap.metadata.hasPendingWrites) return; // eigen wijziging, al lokaal verwerkt
+  if(!snap.exists()) return;
+  try{
+    entries = migrateEntries(JSON.parse(snap.data().value));
+    renderHistory();
+    renderSummary();
+  }catch(e){}
+});
+onSnapshot(docRef(NIGHT_KEY), (snap)=>{
+  if(snap.metadata.hasPendingWrites) return;
+  const remote = snap.exists() ? JSON.parse(snap.data().value) : null;
+  currentNight = remote;
+  if(currentNight){
+    selectedTags = new Set((currentNight.tags||[]).filter(t => !t.startsWith('Alcohol (')));
+    if((currentNight.tags||[]).some(t => t.startsWith('Alcohol ('))) selectedTags.add('Alcohol');
+  }
+  render();
+});
+
+// --- Siri Shortcut ondersteuning: ?actie=slapen / wakker / terug / klaar ---
+async function handleUrlAction(){
+  const params = new URLSearchParams(window.location.search);
+  const actie = params.get('actie');
+  if(!actie) return;
+
+  // wacht tot loadAll() de huidige status heeft ingeladen
+  await new Promise(r => setTimeout(r, 400));
+
+  const banner = document.createElement('div');
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; padding:16px; text-align:center; font-size:15px; font-weight:600; z-index:999;';
+  document.body.prepend(banner);
+
+  if(actie === 'slapen'){
+    $('btnSleep').click();
+    banner.textContent = '🌙 Slaap geregistreerd om ' + new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit'});
+    banner.style.background = '#2c3a5e'; banner.style.color = '#f2e9d8';
+  } else if(actie === 'wakker'){
+    if(isSleeping()){
+      $('btnWake').click();
+      banner.textContent = '☀️ Wakker geregistreerd om ' + new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit'});
+    } else if(currentNight){
+      $('btnAgain').click();
+      banner.textContent = '🌙 Terug slapen geregistreerd';
+    } else {
+      $('btnSleep').click();
+      banner.textContent = '🌙 Nieuwe nacht gestart (er was nog geen actieve nacht)';
+    }
+    banner.style.background = '#e0a56f'; banner.style.color = '#241708';
+  }
+}
+handleUrlAction();
+</script>
+</body>
+</html>
