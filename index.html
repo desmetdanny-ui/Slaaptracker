@@ -190,6 +190,36 @@
 
   <div class="save-hint" id="saveHint"></div>
 
+  <div style="text-align:center; margin: 4px 0 24px;">
+    <button id="btnShowBackfill" type="button" style="background:none; border:1px solid var(--line); color:var(--dusk); font-size:13px; padding:10px 16px; border-radius:999px;">📝 Nacht achteraf ingeven</button>
+  </div>
+
+  <div id="backfillForm" style="display:none; background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px 18px; margin-bottom:22px;">
+    <div style="font-size:13px; color:var(--moon-dim); font-weight:600; margin-bottom:12px;">Nacht achteraf ingeven</div>
+    <div style="font-size:12px; color:var(--text-dim); margin-bottom:14px;">
+      Geef de periodes in dat je écht sliep. Werd je even wakker (bv. om te plassen) en sliep je daarna verder, voeg dan een tweede periode toe — de tussentijd telt niet mee als slaap.
+    </div>
+    <div id="backfillSegments"></div>
+    <button id="btnAddBackfillSeg" type="button" style="width:100%; background:var(--panel-2); border:1px dashed var(--line); color:var(--dusk); font-size:13px; padding:10px; border-radius:10px; margin-top:6px;">+ Nog een periode</button>
+
+    <div style="margin-top:16px;">
+      <div class="quick-tags" id="backfillTags">
+        <div class="tag" data-tag="Mounjaro-avond">Mounjaro genomen</div>
+        <div class="tag" data-tag="Alcohol">Alcohol gedronken</div>
+        <div class="tag" data-tag="Gesnurkt/apneu?">Gesnurkt / apneu?</div>
+        <div class="tag" data-tag="Stress">Stress / piekeren</div>
+        <div class="tag" data-tag="Toilet">Wakker voor toilet</div>
+        <div class="tag" data-tag="Vermoeid overdag">Erg vermoeid overdag</div>
+      </div>
+      <textarea class="note-area" id="backfillNote" placeholder="Extra notitie (optioneel)…" style="margin-top:10px;"></textarea>
+    </div>
+
+    <div style="display:flex; gap:8px; margin-top:16px;">
+      <button id="btnBackfillSave" style="flex:1; background:var(--good); color:#0e1f14; padding:12px; border-radius:12px; font-size:14px;">Opslaan</button>
+      <button id="btnBackfillCancel" type="button" style="flex:1; background:var(--panel-2); color:var(--text-dim); border:1px solid var(--line); padding:12px; border-radius:12px; font-size:14px;">Annuleren</button>
+    </div>
+  </div>
+
   <div class="section-title">Geschiedenis</div>
   <div id="summary"></div>
   <div id="history"></div>
@@ -540,7 +570,7 @@ $('btnSleep').addEventListener('click', async ()=>{
     $('noteInput').value = '';
     $('alcoholQty').value = '1';
     $('alcoholField').classList.remove('show');
-    document.querySelectorAll('.tag').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('#tagBlock .tag').forEach(t=>t.classList.remove('active'));
   }
   currentNight.segments.push({ start: new Date().toISOString(), end: null });
   await saveNight();
@@ -600,7 +630,97 @@ $('btnCancelNight').addEventListener('click', async ()=>{
   flashHint('Nacht geannuleerd — niets opgeslagen');
 });
 
-document.querySelectorAll('.tag').forEach(tagEl=>{
+// --- Nacht achteraf ingeven ---
+let backfillSegCount = 0;
+let backfillSelectedTags = new Set();
+
+function nowLocalInputValue(offsetHours){
+  const d = new Date();
+  d.setHours(d.getHours() - offsetHours);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function addBackfillSegRow(startVal, endVal){
+  const id = backfillSegCount++;
+  const wrap = document.createElement('div');
+  wrap.id = `bfseg-${id}`;
+  wrap.style.cssText = 'display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap;';
+  wrap.innerHTML = `
+    <div style="flex:1; min-width:140px;">
+      <div style="font-size:11px; color:var(--text-dim); margin-bottom:3px;">Sliep vanaf</div>
+      <input type="datetime-local" class="bf-start" value="${startVal}" style="width:100%; background:var(--panel-2); border:1px solid var(--line); color:var(--text); border-radius:8px; padding:8px;">
+    </div>
+    <div style="flex:1; min-width:140px;">
+      <div style="font-size:11px; color:var(--text-dim); margin-bottom:3px;">Tot</div>
+      <input type="datetime-local" class="bf-end" value="${endVal}" style="width:100%; background:var(--panel-2); border:1px solid var(--line); color:var(--text); border-radius:8px; padding:8px;">
+    </div>
+    <button type="button" class="bf-del" data-id="${id}" style="background:none; border:none; color:var(--alert); font-size:18px; padding:0 4px; align-self:flex-end; margin-bottom:8px;">✕</button>
+  `;
+  $('backfillSegments').appendChild(wrap);
+  wrap.querySelector('.bf-del').addEventListener('click', ()=>{
+    if($('backfillSegments').children.length > 1){ wrap.remove(); }
+  });
+}
+
+$('btnShowBackfill').addEventListener('click', ()=>{
+  $('backfillForm').style.display = 'block';
+  $('backfillSegments').innerHTML = '';
+  backfillSegCount = 0;
+  backfillSelectedTags.clear();
+  document.querySelectorAll('#backfillTags .tag').forEach(t=>t.classList.remove('active'));
+  $('backfillNote').value = '';
+  // standaard: één periode, gisterenavond 23:00 tot vanmorgen, als startpunt om aan te passen
+  addBackfillSegRow(nowLocalInputValue(9), nowLocalInputValue(0));
+  $('btnShowBackfill').scrollIntoView({behavior:'smooth', block:'center'});
+});
+
+$('btnAddBackfillSeg').addEventListener('click', ()=>{
+  addBackfillSegRow(nowLocalInputValue(6), nowLocalInputValue(5));
+});
+
+$('btnBackfillCancel').addEventListener('click', ()=>{
+  $('backfillForm').style.display = 'none';
+});
+
+document.getElementById('backfillTags').querySelectorAll('.tag').forEach(tagEl=>{
+  tagEl.addEventListener('click', ()=>{
+    const tag = tagEl.dataset.tag;
+    if(backfillSelectedTags.has(tag)){ backfillSelectedTags.delete(tag); tagEl.classList.remove('active'); }
+    else{ backfillSelectedTags.add(tag); tagEl.classList.add('active'); }
+  });
+});
+
+$('btnBackfillSave').addEventListener('click', async ()=>{
+  const rows = $('backfillSegments').querySelectorAll('[id^="bfseg-"]');
+  const segments = [];
+  for(const row of rows){
+    const startVal = row.querySelector('.bf-start').value;
+    const endVal = row.querySelector('.bf-end').value;
+    if(!startVal || !endVal) continue;
+    const start = new Date(startVal);
+    const end = new Date(endVal);
+    if(isNaN(start.getTime()) || isNaN(end.getTime()) || end <= start) continue;
+    segments.push({ start: start.toISOString(), end: end.toISOString() });
+  }
+  if(segments.length === 0){ flashHint('Vul minstens één geldige periode in'); return; }
+  segments.sort((a,b)=> new Date(a.start) - new Date(b.start));
+
+  const entry = {
+    segments,
+    totalMs: segTotalMs(segments),
+    tags: Array.from(backfillSelectedTags),
+    note: $('backfillNote').value.trim()
+  };
+  entries.unshift(entry);
+  entries.sort((a,b)=> new Date(b.segments[0].start) - new Date(a.segments[0].start));
+  await saveEntries();
+  $('backfillForm').style.display = 'none';
+  render();
+  flashHint('Nacht toegevoegd aan geschiedenis');
+});
+
+document.querySelectorAll('#tagBlock .tag').forEach(tagEl=>{
   tagEl.addEventListener('click', async ()=>{
     const tag = tagEl.dataset.tag;
     if(selectedTags.has(tag)){
